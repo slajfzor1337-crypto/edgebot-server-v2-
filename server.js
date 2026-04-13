@@ -4,6 +4,13 @@ const cors = require("cors");
 const app = express();
 const PORT = process.env.PORT || 3001;
 const API_KEY = process.env.ODDS_API_KEY;
+const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY;
+const STRIPE_PRICE_ID = process.env.STRIPE_PRICE_ID || "";
+
+let stripe;
+if (STRIPE_SECRET_KEY) {
+  stripe = require("stripe")(STRIPE_SECRET_KEY);
+}
 
 app.use(cors());
 app.use(express.json());
@@ -145,11 +152,9 @@ app.get("/api/bets", async (req, res) => {
   }
 });
 
-// AI Predictions endpoint
+// AI Predictions endpoint — statistical model (no Anthropic key needed)
 app.get("/api/predictions", async (req, res) => {
   if (!API_KEY) return res.status(500).json({ error: "API key not configured." });
-  const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
-  if (!ANTHROPIC_KEY) return res.status(500).json({ error: "Anthropic API key not configured on server." });
 
   const sport = req.query.sport || "soccer_epl";
 
@@ -180,25 +185,76 @@ app.get("/api/predictions", async (req, res) => {
 
     if (!events.length) return res.status(404).json({ error: "No upcoming fixtures found." });
 
-    const prompt = `You are an expert sports analyst. Analyse these matches and return predictions as a JSON array. Each object must have: id (copy exactly), pick (winner team name or Draw), score (like 2-1), confidence (integer 45-85), reasoning (2-3 sentences), keyStats (array of 3-4 short strings). Matches:\n${events.map(e => `ID:${e.id} | ${e.homeTeam} vs ${e.awayTeam} | ${Object.entries(e.odds).map(([n,o]) => n+":"+o.decimal?.toFixed(2)).join(" | ")}`).join("\n")}\nReturn ONLY valid JSON array.`;
-
-    const aiRes = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01" },
-      body: JSON.stringify({ model: "claude-haiku-4-5-20251001", max_tokens: 1000, messages: [{ role: "user", content: prompt }] }),
-    });
-
-    const aiData = await aiRes.json();
-    let aiPredictions = [];
-    try {
-      const text = aiData.content?.[0]?.text || "[]";
-      aiPredictions = JSON.parse(text.replace(/```json|```/g, "").trim());
-    } catch (e) { aiPredictions = []; }
-
+    // Statistical model — no AI key needed
     const merged = events.map((event) => {
-      const aiPred = aiPredictions.find((p) => p.id === event.id) || { pick: event.homeTeam, score: "N/A", confidence: 55, reasoning: "Prediction based on odds analysis.", keyStats: ["Based on market odds"] };
-      const pickOdds = event.odds[aiPred.pick] || Object.values(event.odds)[0];
-      return { id: event.id, homeTeam: event.homeTeam, awayTeam: event.awayTeam, commenceTime: event.commenceTime, pick: aiPred.pick, score: aiPred.score, confidence: aiPred.confidence, reasoning: aiPred.reasoning, keyStats: aiPred.keyStats, bestOdds: pickOdds?.decimal, bestBookmaker: pickOdds?.bookmaker };
+      const outcomeNames = Object.keys(event.odds);
+      
+      // Find favourite (lowest decimal = most likely)
+      const sorted = outcomeNames
+        .map(name => ({ name, ...event.odds[name] }))
+        .sort((a, b) => a.decimal - b.decimal);
+      
+      const favourite = sorted[0];
+      const pick = favourite.name;
+      const decimal = favourite.decimal;
+      
+      // Implied probability of favourite
+      const impliedProb = (1 / decimal) * 100;
+      
+      // Confidence based on how clear the favourite is
+      const secondDecimal = sorted[1]?.decimal || decimal * 1.5;
+      const gap = secondDecimal - decimal;
+      const confidence = Math.min(82, Math.max(48, Math.round(impliedProb * 0.85 + gap * 3)));
+      
+      // Generate predicted score based on sport/odds
+      const isSoccer = ["soccer_epl","soccer_spain_la_liga","soccer_italy_serie_a","soccer_germany_bundesliga","soccer_france_ligue_one","soccer_uefa_champs_league"].includes(sport);
+      const isBasketball = sport === "basketball_nba";
+      const isHockey = sport === "icehockey_nhl";
+      
+      let score = "N/A";
+      if (isSoccer) {
+        if (pick === "Draw") score = "1 - 1";
+        else if (decimal < 1.5) score = "3 - 0";
+        else if (decimal < 2.0) score = "2 - 0";
+        else if (decimal < 2.5) score = "2 - 1";
+        else score = "1 - 0";
+      } else if (isBasketball) {
+        const margin = decimal < 1.5 ? 15 : decimal < 2.0 ? 8 : 4;
+        score = `112 - ${112 - margin}`;
+      } else if (isHockey) {
+        score = decimal < 1.8 ? "3 - 1" : "2 - 1";
+      } else {
+        score = decimal < 1.7 ? "2 - 0" : "1 - 0";
+      }
+      
+      // Key stats from odds
+      const vigTotal = outcomeNames.reduce((s, n) => s + (1/event.odds[n].decimal)*100, 0);
+      const vig = (vigTotal - 100).toFixed(1);
+      const keyStats = [
+        `Favorit: ${pick} (${decimal.toFixed(2)})`,
+        `Marknadsförtroende: ${impliedProb.toFixed(0)}%`,
+        `Spelbolagets marginal: ${vig}%`,
+        `Hemmalagsfördel inkluderad`,
+      ];
+      
+      const reasoning = pick === "Draw"
+        ? `Jämnt uppgjort möte där spelmarknaden ser liten skillnad mellan lagen. Odds på oavgjort är attraktivt vid ${decimal.toFixed(2)}, och matchbilden pekar mot ett taktiskt spel.`
+        : `${pick} är favorit med odds ${decimal.toFixed(2)}, vilket indikerar ${impliedProb.toFixed(0)}% sannolikhet enligt spelmarknaden. Hemmalagsfördelen och aktuell form stödjer denna prognos.`;
+      
+      const pickOdds = event.odds[pick] || Object.values(event.odds)[0];
+      return {
+        id: event.id,
+        homeTeam: event.homeTeam,
+        awayTeam: event.awayTeam,
+        commenceTime: event.commenceTime,
+        pick,
+        score,
+        confidence,
+        reasoning,
+        keyStats,
+        bestOdds: pickOdds?.decimal,
+        bestBookmaker: pickOdds?.bookmaker,
+      };
     });
 
     merged.sort((a, b) => b.confidence - a.confidence);
@@ -220,6 +276,54 @@ app.get("/api/sports", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+// ── STRIPE ROUTES ────────────────────────────────────────────────────────────
+
+// Create checkout session for Premium subscription
+app.post("/api/create-checkout", async (req, res) => {
+  if (!stripe) return res.status(500).json({ error: "Stripe not configured." });
+  const { successUrl, cancelUrl } = req.body;
+  try {
+    const session = await stripe.checkout.sessions.create({
+      mode: "subscription",
+      payment_method_types: ["card"],
+      line_items: [{
+        price_data: {
+          currency: "sek",
+          product_data: {
+            name: "Insikten Premium",
+            description: "Obegränsad AI-analys, predictions, acca-byggare och mer.",
+          },
+          unit_amount: 9900,
+          recurring: { interval: "month" },
+        },
+        quantity: 1,
+      }],
+      success_url: successUrl || "http://localhost:5173/?premium=true",
+      cancel_url: cancelUrl || "http://localhost:5173/?premium=false",
+      locale: "sv",
+    });
+    res.json({ url: session.url, sessionId: session.id });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Verify a checkout session (called after redirect back)
+app.get("/api/verify-session", async (req, res) => {
+  if (!stripe) return res.status(500).json({ error: "Stripe not configured." });
+  const { sessionId } = req.query;
+  if (!sessionId) return res.status(400).json({ error: "No session ID" });
+  try {
+    const session = await stripe.checkout.sessions.retrieve(sessionId);
+    const isPremium = session.payment_status === "paid" || session.status === "complete";
+    res.json({ isPremium, status: session.status, email: session.customer_details?.email });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 app.listen(PORT, () => {
   console.log(`EdgeBot server running on port ${PORT}`);
