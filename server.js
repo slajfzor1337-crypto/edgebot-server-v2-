@@ -145,6 +145,69 @@ app.get("/api/bets", async (req, res) => {
   }
 });
 
+// AI Predictions endpoint
+app.get("/api/predictions", async (req, res) => {
+  if (!API_KEY) return res.status(500).json({ error: "API key not configured." });
+  const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
+  if (!ANTHROPIC_KEY) return res.status(500).json({ error: "Anthropic API key not configured on server." });
+
+  const sport = req.query.sport || "soccer_epl";
+
+  try {
+    const url = `${ODDS_BASE}/sports/${sport}/odds/?apiKey=${API_KEY}&regions=eu,uk,us&markets=h2h&oddsFormat=decimal`;
+    const oddsRes = await fetch(url);
+    const oddsData = await oddsRes.json();
+    if (!oddsRes.ok) return res.status(500).json({ error: oddsData.message || "Odds API error" });
+
+    const events = (oddsData || []).slice(0, 8).map((event) => {
+      const bookmakers = event.bookmakers || [];
+      const outcomeMap = {};
+      bookmakers.forEach((bk) => {
+        const market = bk.markets?.find((m) => m.key === "h2h");
+        if (!market) return;
+        market.outcomes.forEach((o) => {
+          if (!outcomeMap[o.name]) outcomeMap[o.name] = [];
+          outcomeMap[o.name].push({ bookmaker: bk.title, decimal: o.price });
+        });
+      });
+      const outcomeNames = Object.keys(outcomeMap);
+      const bestOdds = {};
+      outcomeNames.forEach((name) => {
+        bestOdds[name] = [...outcomeMap[name]].sort((a, b) => b.decimal - a.decimal)[0];
+      });
+      return { id: event.id, homeTeam: event.home_team, awayTeam: event.away_team, commenceTime: event.commence_time, odds: bestOdds };
+    }).filter(e => Object.keys(e.odds).length >= 2);
+
+    if (!events.length) return res.status(404).json({ error: "No upcoming fixtures found." });
+
+    const prompt = `You are an expert sports analyst. Analyse these matches and return predictions as a JSON array. Each object must have: id (copy exactly), pick (winner team name or Draw), score (like 2-1), confidence (integer 45-85), reasoning (2-3 sentences), keyStats (array of 3-4 short strings). Matches:\n${events.map(e => `ID:${e.id} | ${e.homeTeam} vs ${e.awayTeam} | ${Object.entries(e.odds).map(([n,o]) => n+":"+o.decimal?.toFixed(2)).join(" | ")}`).join("\n")}\nReturn ONLY valid JSON array.`;
+
+    const aiRes = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({ model: "claude-haiku-4-5-20251001", max_tokens: 1000, messages: [{ role: "user", content: prompt }] }),
+    });
+
+    const aiData = await aiRes.json();
+    let aiPredictions = [];
+    try {
+      const text = aiData.content?.[0]?.text || "[]";
+      aiPredictions = JSON.parse(text.replace(/```json|```/g, "").trim());
+    } catch (e) { aiPredictions = []; }
+
+    const merged = events.map((event) => {
+      const aiPred = aiPredictions.find((p) => p.id === event.id) || { pick: event.homeTeam, score: "N/A", confidence: 55, reasoning: "Prediction based on odds analysis.", keyStats: ["Based on market odds"] };
+      const pickOdds = event.odds[aiPred.pick] || Object.values(event.odds)[0];
+      return { id: event.id, homeTeam: event.homeTeam, awayTeam: event.awayTeam, commenceTime: event.commenceTime, pick: aiPred.pick, score: aiPred.score, confidence: aiPred.confidence, reasoning: aiPred.reasoning, keyStats: aiPred.keyStats, bestOdds: pickOdds?.decimal, bestBookmaker: pickOdds?.bookmaker };
+    });
+
+    merged.sort((a, b) => b.confidence - a.confidence);
+    res.json({ predictions: merged, sport });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Get available sports
 app.get("/api/sports", async (req, res) => {
   if (!API_KEY) return res.status(500).json({ error: "API key not configured." });
